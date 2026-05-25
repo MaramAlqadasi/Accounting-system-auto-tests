@@ -1,0 +1,21 @@
+{
+  "name": "erp-playwright-tests",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Playwright E2E tests for the SmartERP accounting system (Maram - QA)",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:tc001": "playwright test tc-001",
+    "codegen": "playwright codegen https://acc.devsub.smartlifesys.online",
+    "report": "playwright show-report",
+    "install:browser": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.58.2",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

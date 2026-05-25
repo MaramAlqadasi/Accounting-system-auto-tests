@@ -1,0 +1,2 @@
+# This directory holds generated artifacts (auth.json).
+# Kept in git so the path exists; actual auth.json is gitignored.
