@@ -6,3 +6,6 @@ fixtures/auth.json
 .env
 *.log
 .DS_Store
+
+# Local exploration / probe / dry-run scripts and their output folders (not part of the suite)
+_*

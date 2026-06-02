@@ -5,71 +5,57 @@ const { ManualJournalPage } = require('../../pages/ManualJournalPage');
 /**
  * TC-001: توليد رقم مرجعي تلقائي عند ترك الحقل فارغاً
  *
- * Prerequisite (set up manually in the ERP before running):
- *   - Logged in as accountant (handled by auth.setup.js)
- *   - Branch sequencing disabled
- *   - Reference number prefix empty
+ * Prerequisite (assumed already configured in the test ERP):
+ *   - Logged in as accountant (handled by auth.setup.js).
+ *   - Reference-number prefix empty (auto numbers come back as plain digits e.g. "0007").
  *
  * Steps:
- *   1. Open the manual journal entry creation screen.
- *   2. Fill all required fields EXCEPT the reference number.
- *   3. Click save.
+ *   1. Open the manual journal entry creation modal.
+ *   2. Fill a balanced entry (debit الصندوق / credit مصروفات تسويقية = 100) and
+ *      leave the reference number field EMPTY.
+ *   3. Submit.
  *
  * Expected:
- *   - Entry saved successfully.
- *   - System auto-generates a reference number that is the next in sequence
- *     (last entry's number + 1).
+ *   - Entry is saved (POST returns success + a new entry id).
+ *   - The system auto-generates a non-empty reference number for the saved entry.
  *
- * NOTE: Selectors in ManualJournalPage are TODO placeholders. This test will
- * fail until Maram runs `npm run codegen` and updates them. The failure
- * itself is a useful signal that the auth pipeline works.
+ * NOTE: this test WRITES a real journal entry to the test ERP each run.
  */
 test.describe('Reference number auto-generation', () => {
-  test('TC-001: auto-generates reference number when field left empty', async ({ page, request }) => {
+  // The flow uses a remote modal + Select2 AJAX + read-back fetch; allow headroom.
+  test.setTimeout(150_000);
+
+  test('TC-001: auto-generates a reference number when the field is left empty', async ({ page }) => {
     const journal = new ManualJournalPage(page);
 
-    // --- Arrange: capture the last reference number BEFORE creating the entry.
-    // TODO: implement getLastReferenceNumber() once the journal list page
-    // selectors are known. For now we use a placeholder that the test will
-    // skip if not implemented.
-    const lastRef = await getLastReferenceNumberPlaceholder(page);
+    // --- Arrange / Act
+    await journal.openCreateModal();
+    await journal.dismissOverlays();
 
-    // --- Act
-    await journal.goto();
-    await journal.fillRequiredFieldsExceptReference({
-      date: new Date().toISOString().slice(0, 10), // YYYY-MM-DD
-      description: 'TC-001 اختبار توليد رقم مرجعي تلقائي',
-      debitAccount: 'الصندوق',  // TODO: confirm a valid account label
-      creditAccount: 'المبيعات', // TODO: confirm a valid account label
-      amount: '100.00',
-    });
-    await journal.save();
+    // reference field must start empty (so auto-gen kicks in)
+    expect(await journal.referenceValue(), 'reference field should start empty').toBe('');
 
-    // --- Assert
-    await journal.expectSaveSuccess();
-    const newRef = await journal.getSavedReferenceNumber();
+    const debit = await journal.pickAccount(1, 'الصندوق');
+    expect(debit.val, 'debit account (الصندوق) should resolve to id 44').toBe('44');
+    await journal.fillDebitRow(1, { amount: '100', statement: 'TC-001 توليد رقم مرجعي تلقائي - مدين' });
 
-    expect(newRef, 'auto-generated reference number must not be empty').not.toBe('');
+    const credit = await journal.pickAccount(2, 'مصروفات تسويقية');
+    expect(credit.val, 'credit account (مصروفات تسويقية) should resolve to id 129').toBe('129');
+    await journal.fillCreditRow(2, { amount: '100', statement: 'TC-001 توليد رقم مرجعي تلقائي - دائن' });
 
-    if (lastRef !== null) {
-      const lastNum = parseInt(lastRef, 10);
-      const newNum = parseInt(newRef, 10);
-      expect(newNum, 'new reference number should be last + 1').toBe(lastNum + 1);
-    } else {
-      console.warn('[TC-001] Could not capture last reference number — only verified non-empty.');
-    }
+    // confirm the entry is balanced before submitting
+    expect(await journal.totalDebit.inputValue()).toBe('100');
+    expect(await journal.totalCredit.inputValue()).toBe('100');
+
+    const res = await journal.submit();
+
+    // --- Assert: saved
+    expect(res.success, 'submit should report success').toBe(true);
+    expect(res.id, 'submit should return a new entry id').not.toBe('');
+
+    // --- Assert: a reference number was auto-generated
+    const ref = await journal.readReferenceNumber(res.id);
+    console.log(`[TC-001] entry id=${res.id} -> auto reference number = "${ref}"`);
+    expect(ref, 'auto-generated reference number must not be empty').not.toBe('');
   });
 });
-
-/**
- * Placeholder: returns the last reference number currently in the system, or
- * null if not yet implemented.
- *
- * TODO: replace with a real implementation once Maram identifies the
- * journal-entry list page (likely /accounting/journal_entries or similar).
- * Suggested approach: navigate to the list, sort desc by date, read the
- * first row's reference-number cell.
- */
-async function getLastReferenceNumberPlaceholder(page) {
-  return null;
-}
