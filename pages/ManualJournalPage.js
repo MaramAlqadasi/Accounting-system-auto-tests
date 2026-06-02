@@ -50,6 +50,16 @@ class ManualJournalPage {
     await this.page.goto(`${this.base}${this.listUrl}`, { waitUntil: 'domcontentloaded', timeout: 60_000 });
     await this.page.locator('a.add_btn[href*="edit_dailymove"]').first().waitFor({ state: 'visible', timeout: 25_000 });
     await this.page.waitForLoadState('load').catch(() => {});
+    // The dailymove page pops up periodic bootbox/SweetAlert dialogs that intercept clicks at
+    // random times. Run a 250ms interval that keeps removing them (more reliable than a
+    // MutationObserver for repeatedly re-inserted overlays). Our own #myModal is left intact.
+    await this.page.evaluate(() => {
+      if (window.__overlayKiller) return;
+      window.__overlayKiller = setInterval(() => {
+        document.querySelectorAll('.bootbox, .swal2-container, .swal2-backdrop-show, .sweet-alert').forEach((e) => e.remove());
+        document.querySelectorAll('.modal-backdrop').forEach((b) => b.remove()); // cosmetic; modal stays interactive
+      }, 250);
+    });
     await this.page.waitForTimeout(3500); // let external JS bind delegated handlers
     await this.page.evaluate(() => window.jQuery('a.add_btn[href*="edit_dailymove"]').first().trigger('click'));
     await this.referenceInput.waitFor({ state: 'visible', timeout: 25_000 });
@@ -68,14 +78,15 @@ class ManualJournalPage {
    */
   async dismissOverlays() {
     await this.page.evaluate(() => {
-      document.querySelectorAll('.swal2-container, .sweet-alert, .swal2-backdrop-show').forEach(e => e.remove());
+      document.querySelectorAll('.swal2-container, .sweet-alert, .swal2-backdrop-show, .bootbox').forEach(e => e.remove());
       if (window.jQuery) window.jQuery('#select2-drop').hide();
     });
     await this.page.waitForTimeout(150);
   }
 
   async pickAccount(row, term) {
-    // clear any SweetAlert / open dropdown WITHOUT Escape (Escape closes the modal)
+    // clear any open dropdown WITHOUT Escape (Escape closes the modal); overlays are also
+    // continuously removed by the interval killer set up in openCreateModal.
     await this.dismissOverlays();
     const choice = this.page.locator(`#s2id_choose_account_${row} .select2-choice`).first();
     await choice.scrollIntoViewIfNeeded().catch(() => {});
@@ -123,12 +134,23 @@ class ManualJournalPage {
     const respPromise = this.page.waitForResponse(
       (r) => /\/accounting\/edit_dailymove\/?$/.test(r.url()) && r.request().method() === 'POST',
       { timeout: 30_000 }
-    );
-    await this.submitButton.click();
-    const resp = await respPromise;
+    ).catch(() => null); // null => no save POST fired (treat as rejection)
+    await this.dismissOverlays(); // clear any overlay that would intercept the submit
+    await this.submitButton.scrollIntoViewIfNeeded().catch(() => {});
+    await this.submitButton.click(); // interval killer keeps overlays from intercepting
+
+    const resp = await respPromise; // null if no POST fired (e.g. client-side rejection)
+    if (!resp) {
+      // no save POST: treat as a rejection; try to surface any visible message
+      const msg = await this.page.evaluate(() =>
+        [...document.querySelectorAll('.bootbox, .swal2-popup, .help-block, .text-danger, .alert')]
+          .map((e) => e.textContent.trim()).filter(Boolean).slice(0, 3).join(' | ')
+      ).catch(() => '');
+      return { id: '', success: false, raw: { success: false, msg }, rejected: true };
+    }
     let json = {};
     try { json = JSON.parse(await resp.text()); } catch { /* non-JSON */ }
-    return { id: String(json.id ?? ''), success: !!json.success, raw: json };
+    return { id: String(json.id ?? ''), success: !!json.success, raw: json, rejected: !json.success };
   }
 
   /**
@@ -139,17 +161,64 @@ class ManualJournalPage {
    * @returns {Promise<{id: string, success: boolean, ref: string, typedReference: string|null}>}
    */
   async createBalancedEntry(opts = {}) {
-    const { reference, amount = '100', tag = '' } = opts;
+    const { reference, amount = '100', tag = '', date, branch } = opts;
     await this.openCreateModal();
     await this.dismissOverlays();
+    if (branch !== undefined) {
+      await this.branchSelect.selectOption(String(branch));
+      await this.page.waitForTimeout(800); // branch change may refresh rows
+      await this.dismissOverlays();
+    }
+    if (date !== undefined) {
+      // set via JS to avoid opening the datepicker widget (which would overlay/intercept the account click)
+      await this.page.evaluate((d) => {
+        const el = document.querySelector('#edit_date');
+        if (el) { el.value = d; el.dispatchEvent(new Event('change', { bubbles: true })); if (window.jQuery) window.jQuery(el).trigger('change'); }
+      }, String(date));
+      await this.page.waitForTimeout(200);
+      await this.dismissOverlays();
+    }
     if (reference !== undefined) await this.referenceInput.fill(String(reference));
     await this.pickAccount(1, 'الصندوق');
     await this.fillDebitRow(1, { amount, statement: `${tag} مدين`.trim() });
     await this.pickAccount(2, 'مصروفات تسويقية');
     await this.fillCreditRow(2, { amount, statement: `${tag} دائن`.trim() });
     const res = await this.submit();
-    const ref = await this.readReferenceNumber(res.id);
-    return { id: res.id, success: res.success, ref, typedReference: reference !== undefined ? String(reference) : null };
+    const ref = res.success && res.id ? await this.readReferenceNumber(res.id) : '';
+    return {
+      id: res.id, success: res.success, ref, rejected: !res.success,
+      message: res.raw && res.raw.msg ? String(res.raw.msg) : '',
+      typedReference: reference !== undefined ? String(reference) : null,
+    };
+  }
+
+  /**
+   * Fetch the account-statement (كشف الحساب) data for an account, optionally
+   * filtered by reference number. Returns the raw response body of the
+   * getdetailsnew AJAX endpoint (which includes a "Bond No" column = bone_number).
+   * @param {string|number} accountId
+   * @param {string} [bone] reference-number filter
+   * @returns {Promise<string>}
+   */
+  async accountStatementBody(accountId, bone = '') {
+    const url = `${this.base}/accounting/getdetailsnew/${accountId}`
+      + `?year=2026&from=2026-01-01&to=2026-12-31&order_by=date&order_by_val=asc&currency=SAR`
+      + `&branch_id=&cost_center=&statement=&description=&type=`
+      + `&bone_number=${encodeURIComponent(bone)}&confirm_by=&show_previous=0&show_branch=0`;
+    return await this.page.evaluate(async (u) => (await fetch(u, { credentials: 'include' })).text(), url);
+  }
+
+  /**
+   * Open the create modal, fill a row, then navigate away WITHOUT saving.
+   * Used to prove the counter is not reserved until an actual save.
+   */
+  async openModalAndAbandon() {
+    await this.openCreateModal();
+    await this.dismissOverlays();
+    await this.pickAccount(1, 'الصندوق');
+    await this.fillDebitRow(1, { amount: '100', statement: 'abandoned - not saved' });
+    await this.page.goto(`${this.base}/accounting/index`, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    await this.page.waitForTimeout(1000);
   }
 
   /**
